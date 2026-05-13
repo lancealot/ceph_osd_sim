@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# Derived artifacts from --validate runs (not committed to test bundle)
+validation/_test_bundle/comparison.json
+validation/_test_bundle/sim_output.json

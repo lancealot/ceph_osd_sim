@@ -964,5 +964,307 @@ class TestParallelBenchmarks(unittest.TestCase):
             self.assertGreater(r.ops_per_sec, 0)
 
 
+build_config_from_dict = sim.build_config_from_dict
+summarize_cpu_csv = sim.summarize_cpu_csv
+summarize_workload_csv = sim.summarize_workload_csv
+load_validation_bundle = sim.load_validation_bundle
+compare_predicted_vs_measured = sim.compare_predicted_vs_measured
+
+VALIDATION_TEST_BUNDLE = os.path.join(os.path.dirname(__file__),
+                                       'validation', '_test_bundle')
+
+
+class TestBuildConfigFromDict(unittest.TestCase):
+    """Test building ClusterConfig from a validation bundle dict."""
+
+    def test_basic_config(self):
+        d = {
+            'cpu_cores': 16,
+            'cpu_cores_for_ceph': 14,
+            'drive_type': 'hdd',
+            'drive_count': 12,
+            'protection': 'replicated:3',
+            'object_size': '4m',
+            'rw_ratio': 0.7,
+        }
+        config = build_config_from_dict(d)
+        self.assertEqual(config.cpu_cores, 16)
+        self.assertEqual(config.cpu_cores_for_ceph, 14)
+        self.assertEqual(config.drive_type, 'hdd')
+        self.assertEqual(config.drive_count, 12)
+        self.assertEqual(config.protection_type, 'replicated')
+        self.assertEqual(config.replica_count, 3)
+        self.assertEqual(config.object_size, '4m')
+        self.assertAlmostEqual(config.read_write_ratio, 0.7)
+
+    def test_ec_config(self):
+        d = {
+            'protection': 'ec:4+2',
+            'drive_type': 'nvme',
+        }
+        config = build_config_from_dict(d)
+        self.assertEqual(config.protection_type, 'erasure')
+        self.assertEqual(config.ec_k, 4)
+        self.assertEqual(config.ec_m, 2)
+
+    def test_compression_config(self):
+        d = {
+            'compression': 'zstd',
+            'compression_ratio': 0.6,
+        }
+        config = build_config_from_dict(d)
+        self.assertTrue(config.compression_enabled)
+        self.assertEqual(config.compression_algorithm, 'zstd')
+        self.assertAlmostEqual(config.compression_ratio, 0.6)
+
+    def test_no_compression(self):
+        d = {'compression': 'none'}
+        config = build_config_from_dict(d)
+        self.assertFalse(config.compression_enabled)
+
+    def test_integer_object_size_mapped(self):
+        d = {'object_size': 4194304}
+        config = build_config_from_dict(d)
+        self.assertEqual(config.object_size, '4m')
+
+    def test_pool_type_erasure(self):
+        d = {'pool_type': 'erasure', 'ec_k': 8, 'ec_m': 3}
+        config = build_config_from_dict(d)
+        self.assertEqual(config.protection_type, 'erasure')
+
+    def test_object_size_auto_added(self):
+        d = {'object_size': '16k', 'object_sizes_to_test': ['4k', '4m']}
+        config = build_config_from_dict(d)
+        self.assertIn('16k', config.object_sizes_to_test)
+
+    def test_device_classes(self):
+        d = {
+            'device_classes': [
+                {'drive_type': 'hdd', 'count': 24, 'osds_per_drive': 1},
+                {'drive_type': 'nvme', 'count': 4, 'osds_per_drive': 2},
+            ]
+        }
+        config = build_config_from_dict(d)
+        self.assertEqual(len(config.device_classes), 2)
+        self.assertEqual(config.device_classes[0].count, 24)
+        self.assertEqual(config.device_classes[1].osds_per_drive, 2)
+        self.assertEqual(config.total_drive_count, 28)
+
+
+class TestSummarizeCpuCsv(unittest.TestCase):
+    """Test CPU CSV parsing and aggregation."""
+
+    def test_parse_test_bundle(self):
+        csv_path = os.path.join(VALIDATION_TEST_BUNDLE, 'cpu.csv')
+        if not os.path.exists(csv_path):
+            self.skipTest('Test bundle not found')
+        result = summarize_cpu_csv(csv_path)
+        self.assertIn('per_osd', result)
+        self.assertIn('bucket_totals', result)
+        self.assertEqual(len(result['per_osd']), 2)  # osd 0 and 1
+        self.assertGreater(result['sample_count'], 0)
+
+    def test_window_filtering(self):
+        csv_path = os.path.join(VALIDATION_TEST_BUNDLE, 'cpu.csv')
+        if not os.path.exists(csv_path):
+            self.skipTest('Test bundle not found')
+        # Window that includes only second sample
+        result = summarize_cpu_csv(csv_path, window=(1704067210.5, 1704067211.5))
+        self.assertGreater(result['sample_count'], 0)
+        # Should be fewer samples than unfiltered
+        full = summarize_cpu_csv(csv_path)
+        self.assertLess(result['sample_count'], full['sample_count'])
+
+    def test_bucket_totals_present(self):
+        csv_path = os.path.join(VALIDATION_TEST_BUNDLE, 'cpu.csv')
+        if not os.path.exists(csv_path):
+            self.skipTest('Test bundle not found')
+        result = summarize_cpu_csv(csv_path)
+        self.assertIn('op_pipeline', result['bucket_totals'])
+        self.assertIn('bluestore_kv', result['bucket_totals'])
+        self.assertGreater(result['bucket_totals']['op_pipeline'], 0)
+
+
+class TestSummarizeWorkloadCsv(unittest.TestCase):
+    """Test workload CSV parsing."""
+
+    def test_parse_test_bundle(self):
+        csv_path = os.path.join(VALIDATION_TEST_BUNDLE, 'workload.csv')
+        if not os.path.exists(csv_path):
+            self.skipTest('Test bundle not found')
+        result = summarize_workload_csv(csv_path)
+        self.assertGreater(result['total_finished'], 0)
+        self.assertGreater(result['total_mbps'], 0)
+        self.assertGreater(result['duration_sec'], 0)
+        self.assertEqual(len(result['window']), 2)
+
+
+class TestValidationBundle(unittest.TestCase):
+    """Test loading a validation bundle."""
+
+    def test_load_bundle(self):
+        if not os.path.exists(VALIDATION_TEST_BUNDLE):
+            self.skipTest('Test bundle not found')
+        config_dict, measured, meta = load_validation_bundle(
+            VALIDATION_TEST_BUNDLE)
+        self.assertIn('run_id', config_dict)
+        self.assertIn('per_osd', measured)
+        self.assertIn('avg_cpu_us_per_op', measured)
+        self.assertIsNotNone(measured['avg_cpu_us_per_op'])
+
+    def test_load_missing_bundle_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            load_validation_bundle('/nonexistent/path')
+
+    def test_config_from_bundle(self):
+        if not os.path.exists(VALIDATION_TEST_BUNDLE):
+            self.skipTest('Test bundle not found')
+        config_dict, _, _ = load_validation_bundle(VALIDATION_TEST_BUNDLE)
+        config = build_config_from_dict(config_dict)
+        self.assertEqual(config.cpu_cores, 16)
+        self.assertEqual(config.protection_type, 'replicated')
+        self.assertEqual(config.object_size, '4m')
+
+
+class TestComparePredictedVsMeasured(unittest.TestCase):
+    """Test the prediction vs measurement comparison logic."""
+
+    def _make_capacity(self, cpu_per_io=30.0):
+        return {
+            'cpu_us_per_io': cpu_per_io,
+            'max_osds_adjusted': 100,
+            'overhead_multiplier': 1.2,
+            'per_operation_costs': {
+                '_crc32c_weighted': 5.0,
+                '_compression_weighted': 0.0,
+                '_protection_weighted': 10.0,
+                '_rocksdb_weighted': 8.0,
+                '_crush_weighted': 2.0,
+                '_scrub_weighted': 0.5,
+            },
+        }
+
+    def _make_measured(self):
+        return {
+            'avg_cpu_us_per_op': 40.0,
+            'osd_count': 2,
+            'total_ops': 10000,
+            'per_osd': {
+                '0': {'total_cpu_us': 200000, 'op_count': 5000},
+                '1': {'total_cpu_us': 200000, 'op_count': 5000},
+            },
+            'bucket_totals': {
+                'op_pipeline': 240000.0,
+                'bluestore_kv': 80000.0,
+                'rocksdb_compact': 24000.0,
+                'messenger': 40000.0,
+                'other': 10000.0,
+            },
+        }
+
+    def test_basic_comparison(self):
+        config = ClusterConfig()
+        capacity = self._make_capacity(30.0)
+        measured = self._make_measured()
+        result = compare_predicted_vs_measured(config, capacity, measured, {})
+        self.assertEqual(result['predicted_cpu_us_per_io'], 30.0)
+        self.assertEqual(result['measured_cpu_us_per_op'], 40.0)
+        self.assertAlmostEqual(result['delta_cpu_us'], -10.0)
+        self.assertAlmostEqual(result['ratio'], 0.75)
+        self.assertAlmostEqual(result['error_pct'], 25.0)
+
+    def test_over_prediction(self):
+        config = ClusterConfig()
+        capacity = self._make_capacity(50.0)
+        measured = self._make_measured()
+        result = compare_predicted_vs_measured(config, capacity, measured, {})
+        self.assertGreater(result['delta_cpu_us'], 0)
+        self.assertGreater(result['ratio'], 1.0)
+
+    def test_bucket_comparison_present(self):
+        config = ClusterConfig()
+        capacity = self._make_capacity()
+        measured = self._make_measured()
+        result = compare_predicted_vs_measured(config, capacity, measured, {})
+        bc = result['bucket_comparison']
+        self.assertIn('op_pipeline', bc)
+        self.assertIn('bluestore_kv', bc)
+        self.assertGreater(bc['op_pipeline']['predicted_us_per_io'], 0)
+        self.assertIsNotNone(bc['op_pipeline']['measured_us_per_op'])
+
+    def test_no_measured_ops(self):
+        config = ClusterConfig()
+        capacity = self._make_capacity()
+        measured = {'avg_cpu_us_per_op': None, 'osd_count': 0,
+                    'total_ops': 0, 'per_osd': {}, 'bucket_totals': {}}
+        result = compare_predicted_vs_measured(config, capacity, measured, {})
+        self.assertIsNone(result['measured_cpu_us_per_op'])
+        self.assertIsNone(result['delta_cpu_us'])
+
+    def test_per_osd_summary(self):
+        config = ClusterConfig()
+        capacity = self._make_capacity()
+        measured = self._make_measured()
+        result = compare_predicted_vs_measured(config, capacity, measured, {})
+        self.assertIn('0', result['per_osd'])
+        self.assertIn('1', result['per_osd'])
+        self.assertEqual(result['per_osd']['0']['op_count'], 5000)
+
+
+class TestValidateCLI(unittest.TestCase):
+    """Test the --validate CLI flag end-to-end."""
+
+    def test_validate_test_bundle(self):
+        if not os.path.exists(VALIDATION_TEST_BUNDLE):
+            self.skipTest('Test bundle not found')
+        result = subprocess.run(
+            [sys.executable, 'ceph-cpu-io-sim.py',
+             '--validate', VALIDATION_TEST_BUNDLE],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, f"stderr: {result.stderr}")
+        self.assertIn('Validation Comparison Report', result.stdout)
+        self.assertIn('Predicted', result.stdout)
+
+    def test_validate_json_output(self):
+        if not os.path.exists(VALIDATION_TEST_BUNDLE):
+            self.skipTest('Test bundle not found')
+        result = subprocess.run(
+            [sys.executable, 'ceph-cpu-io-sim.py',
+             '--validate', VALIDATION_TEST_BUNDLE, '--json'],
+            capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, f"stderr: {result.stderr}")
+        data = json.loads(result.stdout)
+        self.assertIn('comparison', data)
+        self.assertIn('predicted_capacity', data)
+
+    def test_validate_missing_dir(self):
+        result = subprocess.run(
+            [sys.executable, 'ceph-cpu-io-sim.py',
+             '--validate', '/nonexistent/path'],
+            capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_validate_writes_comparison_json(self):
+        if not os.path.exists(VALIDATION_TEST_BUNDLE):
+            self.skipTest('Test bundle not found')
+        comp_path = os.path.join(VALIDATION_TEST_BUNDLE, 'comparison.json')
+        # Remove if exists from previous run
+        if os.path.exists(comp_path):
+            os.unlink(comp_path)
+        subprocess.run(
+            [sys.executable, 'ceph-cpu-io-sim.py',
+             '--validate', VALIDATION_TEST_BUNDLE],
+            capture_output=True, text=True, timeout=120)
+        self.assertTrue(os.path.exists(comp_path))
+        with open(comp_path) as f:
+            data = json.load(f)
+        self.assertIn('predicted_cpu_us_per_io', data)
+        # Cleanup
+        os.unlink(comp_path)
+        sim_path = os.path.join(VALIDATION_TEST_BUNDLE, 'sim_output.json')
+        if os.path.exists(sim_path):
+            os.unlink(sim_path)
+
+
 if __name__ == '__main__':
     unittest.main()

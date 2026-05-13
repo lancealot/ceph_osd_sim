@@ -1,0 +1,50 @@
+{
+  "run_id": "test_bundle_001",
+  "pool_name": "val_test_1704067200",
+  "pool_type": "replicated",
+  "pool_size": 3,
+  "ec_profile": "",
+  "pg_num": 128,
+  "compression": "none",
+  "object_size": 4194304,
+  "object_size_str": "4m",
+  "threads": 16,
+  "warmup_duration": 10,
+  "measurement_duration": 60,
+  "rw_ratio": 0.7,
+  "measurement_window": {
+    "start": 1704067210.0,
+    "end": 1704067214.0
+  },
+  "phases": [
+    {
+      "mode": "write",
+      "duration": 60,
+      "summary": {
+        "total_time_run": 5.0,
+        "bandwidth__mb_per_sec_": 180.0,
+        "average_iops": 45.0
+      },
+      "start_time": 1704067210.0,
+      "end_time": 1704067214.0
+    }
+  ],
+  "perf_dump_deltas": {
+    "0": {
+      "osd": {
+        "op": 5000,
+        "op_r": 3500,
+        "op_w": 1500
+      }
+    },
+    "1": {
+      "osd": {
+        "op": 4800,
+        "op_r": 3360,
+        "op_w": 1440
+      }
+    }
+  },
+  "pool_info": null,
+  "ceph_config": null
+}

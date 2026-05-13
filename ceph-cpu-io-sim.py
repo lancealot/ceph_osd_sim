@@ -2958,6 +2958,501 @@ def compare_with_real(csv_path: str, config: ClusterConfig,
 
 
 # ---------------------------------------------------------------------------
+# Validation Framework
+# ---------------------------------------------------------------------------
+
+def build_config_from_dict(d: dict) -> ClusterConfig:
+    """Build a ClusterConfig from a validation bundle config.json dict."""
+    config = ClusterConfig()
+
+    config.cpu_cores = d.get('cpu_cores', 0)
+    config.cpu_cores_for_ceph = d.get('cpu_cores_for_ceph', 0)
+    config.cpu_model = d.get('cpu_model', '')
+
+    config.drive_type = d.get('drive_type', 'hdd')
+    config.drive_count = d.get('drive_count', 12)
+    config.drive_iops = d.get('drive_iops', 0)
+    config.osds_per_drive = d.get('osds_per_drive', 1)
+
+    if 'device_classes' in d:
+        config.device_classes = [
+            DeviceClass(
+                drive_type=dc.get('drive_type', 'hdd'),
+                count=dc.get('count', 1),
+                iops_override=dc.get('iops_override', 0),
+                osds_per_drive=dc.get('osds_per_drive', 1),
+            )
+            for dc in d['device_classes']
+        ]
+        if config.device_classes:
+            config.drive_type = config.device_classes[0].drive_type
+            config.drive_count = config.total_drive_count
+
+    prot = d.get('protection', '')
+    if prot:
+        ptype, rep, ec_k, ec_m = parse_protection(prot)
+        config.protection_type = ptype
+        config.replica_count = rep
+        config.ec_k = ec_k
+        config.ec_m = ec_m
+    else:
+        config.protection_type = d.get('protection_type', 'replicated')
+        config.replica_count = d.get('replica_count', 3)
+        config.ec_k = d.get('ec_k', 4)
+        config.ec_m = d.get('ec_m', 2)
+
+    pool_type = d.get('pool_type', '')
+    if pool_type == 'erasure' and config.protection_type == 'replicated':
+        config.protection_type = 'erasure'
+    pool_size = d.get('pool_size', 0)
+    if pool_size and config.protection_type == 'replicated':
+        config.replica_count = pool_size
+
+    compress = d.get('compression', 'none')
+    if compress and compress != 'none':
+        config.compression_enabled = True
+        config.compression_algorithm = compress
+    config.compression_ratio = d.get('compression_ratio', 0.5)
+    config.compression_mode = d.get('compression_mode', 'passive')
+
+    config.wal_db_separate = d.get('wal_db_separate', False)
+    config.recovery_osds = d.get('recovery_osds', 0)
+
+    obj_size = d.get('object_size', '4m')
+    if isinstance(obj_size, int):
+        for name, val in OBJECT_SIZES.items():
+            if val == obj_size:
+                obj_size = name
+                break
+        else:
+            obj_size = '4m'
+    config.object_size = obj_size
+
+    config.workload_pattern = d.get('workload_pattern', 'mixed')
+    config.read_write_ratio = d.get('rw_ratio', d.get('read_write_ratio', 0.7))
+    config.scrub_frequency = d.get('scrub_frequency', 'daily')
+    config.scenario = d.get('scenario', 'typical')
+    config.benchmark_duration = d.get('benchmark_duration', 5.0)
+    config.object_sizes_to_test = d.get('object_sizes_to_test',
+                                         ['4k', '64k', '128k', '4m'])
+
+    if config.object_size not in config.object_sizes_to_test:
+        config.object_sizes_to_test.append(config.object_size)
+
+    return config
+
+
+def summarize_cpu_csv(path: str,
+                      window: Optional[Tuple[float, float]] = None
+                      ) -> Dict[str, Any]:
+    """Parse a CPU CSV and aggregate per-OSD and per-bucket totals.
+
+    Returns:
+        {
+            'per_osd': {osd_id: {'total_cpu_us', 'user_cpu_us',
+                                  'system_cpu_us', 'samples', 'buckets': {}}},
+            'bucket_totals': {bucket: cpu_us},
+            'sample_count': int,
+        }
+    """
+    per_osd: Dict[str, Any] = {}
+    bucket_totals: Dict[str, float] = {}
+    sample_count = 0
+
+    with open(path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            ts = float(row['timestamp'])
+            if window:
+                if ts < window[0] or ts > window[1]:
+                    continue
+
+            osd_id = row['osd_id']
+            bucket = row['bucket']
+            cpu_total = float(row['cpu_us_total'])
+            cpu_user = float(row['cpu_us_user'])
+            cpu_sys = float(row['cpu_us_system'])
+
+            if osd_id not in per_osd:
+                per_osd[osd_id] = {
+                    'total_cpu_us': 0.0,
+                    'user_cpu_us': 0.0,
+                    'system_cpu_us': 0.0,
+                    'samples': 0,
+                    'buckets': {},
+                }
+            entry = per_osd[osd_id]
+            entry['total_cpu_us'] += cpu_total
+            entry['user_cpu_us'] += cpu_user
+            entry['system_cpu_us'] += cpu_sys
+            entry['samples'] += 1
+
+            if bucket not in entry['buckets']:
+                entry['buckets'][bucket] = {'cpu_us': 0.0, 'samples': 0}
+            entry['buckets'][bucket]['cpu_us'] += cpu_total
+            entry['buckets'][bucket]['samples'] += 1
+
+            bucket_totals[bucket] = bucket_totals.get(bucket, 0.0) + cpu_total
+            sample_count += 1
+
+    return {
+        'per_osd': per_osd,
+        'bucket_totals': bucket_totals,
+        'sample_count': sample_count,
+    }
+
+
+def summarize_workload_csv(path: str) -> Dict[str, Any]:
+    """Parse a workload CSV and compute summary stats.
+
+    Returns:
+        {'total_finished': int, 'total_mbps': float, 'duration_sec': float,
+         'window': (start, end)}
+    """
+    rows = []
+    with open(path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+
+    if not rows:
+        return {'total_finished': 0, 'total_mbps': 0.0,
+                'duration_sec': 0.0, 'window': (0.0, 0.0)}
+
+    timestamps = [float(r['timestamp']) for r in rows]
+    t_start = min(timestamps)
+    t_end = max(timestamps)
+    total_finished = max(int(r.get('finished', 0)) for r in rows)
+    avg_mbps_values = [float(r['avg_mbps']) for r in rows
+                       if float(r['avg_mbps']) > 0]
+    avg_mbps = (sum(avg_mbps_values) / len(avg_mbps_values)
+                if avg_mbps_values else 0.0)
+
+    return {
+        'total_finished': total_finished,
+        'total_mbps': avg_mbps,
+        'duration_sec': t_end - t_start,
+        'window': (t_start, t_end),
+    }
+
+
+def load_validation_bundle(bundle_dir: str
+                           ) -> Tuple[Dict, Dict, Dict]:
+    """Load a validation bundle directory.
+
+    Returns:
+        (config_dict, measured_dict, run_metadata_dict)
+    """
+    config_path = os.path.join(bundle_dir, 'config.json')
+    measured_path = os.path.join(bundle_dir, 'measured.json')
+
+    with open(config_path) as f:
+        config_dict = json.load(f)
+
+    if os.path.exists(measured_path):
+        with open(measured_path) as f:
+            measured = json.load(f)
+    else:
+        measured = _build_measured_from_raw(bundle_dir, config_dict)
+
+    meta = {}
+    workload_meta_path = os.path.join(bundle_dir, 'workload_meta.json')
+    if os.path.exists(workload_meta_path):
+        with open(workload_meta_path) as f:
+            meta = json.load(f)
+
+    return config_dict, measured, meta
+
+
+def _build_measured_from_raw(bundle_dir: str,
+                             config_dict: dict) -> Dict[str, Any]:
+    """Build measured summary from raw CSVs when measured.json is absent."""
+    measured: Dict[str, Any] = {
+        'per_osd': {},
+        'bucket_totals': {},
+        'sample_count': 0,
+        'osd_count': 0,
+        'total_ops': 0,
+        'total_cpu_us': 0.0,
+        'avg_cpu_us_per_op': None,
+    }
+
+    cpu_path = os.path.join(bundle_dir, 'cpu.csv')
+    workload_path = os.path.join(bundle_dir, 'workload.csv')
+
+    window = None
+    workload_meta_path = os.path.join(bundle_dir, 'workload_meta.json')
+    if os.path.exists(workload_meta_path):
+        with open(workload_meta_path) as f:
+            wm = json.load(f)
+        w = wm.get('measurement_window', {})
+        if w.get('start') and w.get('end'):
+            window = (w['start'], w['end'])
+
+    if os.path.exists(cpu_path):
+        cpu_summary = summarize_cpu_csv(cpu_path, window)
+        measured['per_osd'] = cpu_summary['per_osd']
+        measured['bucket_totals'] = cpu_summary['bucket_totals']
+        measured['sample_count'] = cpu_summary['sample_count']
+        measured['osd_count'] = len(cpu_summary['per_osd'])
+        measured['total_cpu_us'] = sum(
+            d['total_cpu_us'] for d in cpu_summary['per_osd'].values())
+
+    return measured
+
+
+def compare_predicted_vs_measured(config: ClusterConfig,
+                                  capacity: Dict[str, Any],
+                                  measured: Dict[str, Any],
+                                  meta: Dict[str, Any]
+                                  ) -> Dict[str, Any]:
+    """Compare simulator prediction against measured validation data.
+
+    Returns a comparison dict with predicted/measured/delta for key metrics.
+    """
+    predicted_cpu_per_io = capacity.get('cpu_us_per_io', 0.0)
+    measured_cpu_per_op = measured.get('avg_cpu_us_per_op')
+
+    comparison = {
+        'predicted_cpu_us_per_io': round(predicted_cpu_per_io, 2),
+        'measured_cpu_us_per_op': (round(measured_cpu_per_op, 2)
+                                   if measured_cpu_per_op else None),
+        'osd_count': measured.get('osd_count', 0),
+        'total_ops': measured.get('total_ops', 0),
+    }
+
+    if measured_cpu_per_op and measured_cpu_per_op > 0:
+        delta = predicted_cpu_per_io - measured_cpu_per_op
+        ratio = predicted_cpu_per_io / measured_cpu_per_op
+        comparison['delta_cpu_us'] = round(delta, 2)
+        comparison['ratio'] = round(ratio, 3)
+        comparison['error_pct'] = round(
+            abs(delta) / measured_cpu_per_op * 100, 1)
+    else:
+        comparison['delta_cpu_us'] = None
+        comparison['ratio'] = None
+        comparison['error_pct'] = None
+
+    # Per-operation predicted costs vs thread-bucket measured costs
+    pred_costs = capacity.get('per_operation_costs', {})
+    meas_buckets = measured.get('bucket_totals', {})
+    total_ops = measured.get('total_ops', 0)
+
+    bucket_comparison = {}
+    bucket_to_pred = {
+        'op_pipeline': ['_crc32c_weighted', '_compression_weighted',
+                        '_protection_weighted'],
+        'bluestore_kv': ['_rocksdb_weighted'],
+        'rocksdb_compact': [],
+        'messenger': [],
+    }
+
+    for bucket, pred_keys in bucket_to_pred.items():
+        pred_sum = sum(pred_costs.get(k, 0) for k in pred_keys)
+        meas_total = meas_buckets.get(bucket, 0)
+        meas_per_op = meas_total / total_ops if total_ops > 0 else None
+
+        bucket_comparison[bucket] = {
+            'predicted_us_per_io': round(pred_sum, 2),
+            'measured_total_us': round(meas_total, 1),
+            'measured_us_per_op': (round(meas_per_op, 2)
+                                   if meas_per_op is not None else None),
+        }
+        if meas_per_op and meas_per_op > 0 and pred_sum > 0:
+            bucket_comparison[bucket]['ratio'] = round(
+                pred_sum / meas_per_op, 3)
+
+    comparison['bucket_comparison'] = bucket_comparison
+
+    # Per-OSD summary
+    per_osd_summary = {}
+    for osd_id, osd_data in measured.get('per_osd', {}).items():
+        entry = {
+            'total_cpu_us': round(osd_data.get('total_cpu_us', 0), 1),
+            'op_count': osd_data.get('op_count', 0),
+        }
+        if entry['op_count'] and entry['op_count'] > 0:
+            entry['cpu_us_per_op'] = round(
+                entry['total_cpu_us'] / entry['op_count'], 2)
+        per_osd_summary[osd_id] = entry
+    comparison['per_osd'] = per_osd_summary
+
+    return comparison
+
+
+def _validate_main(bundle_dir: str, json_output: bool = False) -> int:
+    """Run validation comparison against a bundle directory."""
+    try:
+        config_dict, measured, meta = load_validation_bundle(bundle_dir)
+    except FileNotFoundError as e:
+        print(f"Error: {e}")
+        return 1
+    except json.JSONDecodeError as e:
+        print(f"Error parsing JSON: {e}")
+        return 1
+
+    config = build_config_from_dict(config_dict)
+
+    if config.cpu_cores == 0:
+        # Try to get CPU info from metadata
+        cpu_meta_path = os.path.join(bundle_dir, 'cpu_meta.json')
+        if os.path.exists(cpu_meta_path):
+            with open(cpu_meta_path) as f:
+                cpu_meta = json.load(f)
+            nodes = cpu_meta.get('nodes', {})
+            if nodes:
+                first_node = next(iter(nodes.values()))
+                config.cpu_cores = first_node.get('cpu_count', 0)
+                config.cpu_model = first_node.get('cpu_model', '')
+        if config.cpu_cores == 0:
+            config.cpu_cores = os.cpu_count() or 4
+    if config.cpu_cores_for_ceph <= 0:
+        config.cpu_cores_for_ceph = float(max(1, config.cpu_cores - 2))
+
+    libs = LibraryManager()
+    benchmarks = CephBenchmarks(libs, config, verbose=False)
+    results = benchmarks.run_all()
+
+    model = OSDCapacityModel(config, results, libs=libs)
+    capacity = model.calculate()
+
+    comparison = compare_predicted_vs_measured(config, capacity, measured, meta)
+
+    if json_output:
+        output = {
+            'bundle': bundle_dir,
+            'config': config_dict,
+            'comparison': comparison,
+            'predicted_capacity': {
+                'max_osds_adjusted': capacity.get('max_osds_adjusted'),
+                'cpu_us_per_io': capacity.get('cpu_us_per_io'),
+                'overhead_multiplier': capacity.get('overhead_multiplier'),
+                'per_operation_costs': capacity.get('per_operation_costs'),
+            },
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        _print_validation_report(bundle_dir, config, config_dict,
+                                 capacity, comparison, measured)
+
+    # Save comparison to bundle
+    comp_path = os.path.join(bundle_dir, 'comparison.json')
+    with open(comp_path, 'w') as f:
+        json.dump(comparison, f, indent=2)
+
+    sim_path = os.path.join(bundle_dir, 'sim_output.json')
+    with open(sim_path, 'w') as f:
+        json.dump({
+            'cpu_us_per_io': capacity.get('cpu_us_per_io'),
+            'max_osds_adjusted': capacity.get('max_osds_adjusted'),
+            'overhead_multiplier': capacity.get('overhead_multiplier'),
+            'per_operation_costs': capacity.get('per_operation_costs', {}),
+        }, f, indent=2)
+
+    return 0
+
+
+def _print_validation_report(bundle_dir: str,
+                              config: ClusterConfig,
+                              config_dict: dict,
+                              capacity: Dict[str, Any],
+                              comparison: Dict[str, Any],
+                              measured: Dict[str, Any]):
+    """Print a human-readable validation comparison report."""
+    print()
+    print("=" * 60)
+    print("  Validation Comparison Report")
+    print("=" * 60)
+    print(f"Bundle:    {bundle_dir}")
+    print(f"Profile:   {config_dict.get('profile', 'unknown')}")
+    print(f"Run ID:    {config_dict.get('run_id', 'unknown')}")
+
+    print()
+    print("=== Configuration ===")
+    print(f"CPU:          {config.cpu_model or 'Unknown'} "
+          f"({config.cpu_cores} cores, "
+          f"{config.cpu_cores_for_ceph:.0f} for Ceph)")
+    if config.device_classes:
+        for dc in config.device_classes:
+            print(f"Drives:       {dc.count}x {dc.drive_type.upper()} "
+                  f"({dc.osds_per_drive} OSD/drive)")
+    else:
+        print(f"Drives:       {config.drive_count}x "
+              f"{config.drive_type.upper()}")
+    print(f"Protection:   {config.protection_type}"
+          f"{'(' + str(config.replica_count) + 'x)' if config.protection_type == 'replicated' else ''}"
+          f"{'(' + str(config.ec_k) + '+' + str(config.ec_m) + ')' if config.protection_type == 'erasure' else ''}")
+    if config.compression_enabled:
+        print(f"Compression:  {config.compression_algorithm}")
+    print(f"Object size:  {config.object_size}")
+    print(f"R/W ratio:    {config.read_write_ratio}")
+
+    print()
+    print("=== CPU Cost Per IO — Predicted vs Measured ===")
+    pred = comparison.get('predicted_cpu_us_per_io')
+    meas = comparison.get('measured_cpu_us_per_op')
+    print(f"Predicted:  {pred:,.2f} us/IO" if pred else "Predicted:  N/A")
+    if meas:
+        print(f"Measured:   {meas:,.2f} us/op")
+        delta = comparison.get('delta_cpu_us')
+        ratio = comparison.get('ratio')
+        error = comparison.get('error_pct')
+        direction = "over" if delta and delta > 0 else "under"
+        print(f"Delta:      {delta:+,.2f} us ({direction}-predicted)")
+        print(f"Ratio:      {ratio:.3f}x (predicted / measured)")
+        print(f"Error:      {error:.1f}%")
+    else:
+        print("Measured:   N/A (no op count in perf dump)")
+        print("  Note: without ceph daemon perf dump data, per-op CPU")
+        print("  cannot be computed. Re-run with perf dump collection.")
+
+    print()
+    print("=== Thread Bucket Decomposition ===")
+    bc = comparison.get('bucket_comparison', {})
+    header = (f"{'Bucket':<20} {'Pred us/IO':>12} {'Meas us/op':>12} "
+              f"{'Ratio':>8}")
+    print(header)
+    print("-" * len(header))
+    for bucket in ['op_pipeline', 'bluestore_kv', 'rocksdb_compact',
+                    'messenger', 'other']:
+        data = bc.get(bucket, {})
+        pred_str = f"{data.get('predicted_us_per_io', 0):,.2f}"
+        meas_val = data.get('measured_us_per_op')
+        meas_str = f"{meas_val:,.2f}" if meas_val is not None else "N/A"
+        ratio_val = data.get('ratio')
+        ratio_str = f"{ratio_val:.3f}x" if ratio_val is not None else "N/A"
+        print(f"{bucket:<20} {pred_str:>12} {meas_str:>12} {ratio_str:>8}")
+
+    per_osd = comparison.get('per_osd', {})
+    if per_osd:
+        print()
+        print("=== Per-OSD Summary ===")
+        header = f"{'OSD':<10} {'CPU us (total)':>16} {'Ops':>12} {'us/op':>10}"
+        print(header)
+        print("-" * len(header))
+        for osd_id in sorted(per_osd.keys(),
+                              key=lambda x: int(x) if x.isdigit() else x):
+            d = per_osd[osd_id]
+            ops_str = f"{d.get('op_count', 0):,}" if d.get('op_count') else "N/A"
+            usop = d.get('cpu_us_per_op')
+            usop_str = f"{usop:,.2f}" if usop else "N/A"
+            print(f"osd.{osd_id:<6} {d['total_cpu_us']:>16,.0f} "
+                  f"{ops_str:>12} {usop_str:>10}")
+
+    osd_count = measured.get('osd_count', 0)
+    total_ops = measured.get('total_ops', 0)
+    print()
+    print(f"OSDs measured:  {osd_count}")
+    print(f"Total ops:      {total_ops:,}" if total_ops else
+          "Total ops:      N/A")
+
+    print()
+    print("Files written:")
+    print(f"  {os.path.join(bundle_dir, 'comparison.json')}")
+    print(f"  {os.path.join(bundle_dir, 'sim_output.json')}")
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -3228,6 +3723,9 @@ Examples:
                           '*_benchmarks.csv and *_capacity.csv)')
     out.add_argument('--compare', default=None,
                      help='Compare with ceph-bench.sh CSV results')
+    out.add_argument('--validate', default=None, metavar='DIR',
+                     help='Compare predictions against a validation bundle '
+                          'directory (from benchmarks/run-validation.sh)')
     out.add_argument('--json', action='store_true',
                      help='Output results as JSON')
 
@@ -3464,6 +3962,10 @@ def build_config_from_args(args) -> ClusterConfig:
 
 def main():
     args = parse_args()
+
+    if args.validate:
+        sys.exit(_validate_main(args.validate,
+                                json_output=args.json))
 
     libs = LibraryManager()
 
